@@ -111,48 +111,56 @@ class MasterReplicaConnectionProvider<K, V> {
             logger.debug("getConnectionAsync(" + intent + ")");
         }
 
-        if (readFrom != null && intent == ConnectionIntent.READ) {
-            List<RedisNodeDescription> selection = readFrom.select(new ReadFrom.Nodes() {
+        ReadFrom rf = this.readFrom;
+        // fast-path when we need a master connection
+        // basically we use master when either we need to write or readFrom is explicitly master or undefined
+        boolean requiresMaster = intent != ConnectionIntent.READ
+                || rf == null
+                || rf == ReadFrom.MASTER
+                || rf == ReadFrom.UPSTREAM;
 
-                @Override
-                public List<RedisNodeDescription> getNodes() {
-                    return knownNodes;
-                }
-
-                @Override
-                public Iterator<RedisNodeDescription> iterator() {
-                    return knownNodes.iterator();
-                }
-
-            });
-
-            if (selection.isEmpty()) {
-                throw new RedisException(String.format("Cannot determine a node to read (Known nodes: %s) with setting %s",
-                        knownNodes, readFrom));
-            }
-
-            try {
-
-                Flux<StatefulRedisConnection<K, V>> connections = Flux.empty();
-
-                for (RedisNodeDescription node : selection) {
-                    connections = connections.concatWith(Mono.fromFuture(getConnection(node)));
-                }
-
-                if (OrderingReadFromAccessor.isOrderSensitive(readFrom) || selection.size() == 1) {
-                    return connections.filter(StatefulConnection::isOpen).next().switchIfEmpty(connections.next()).toFuture();
-                }
-
-                return connections.filter(StatefulConnection::isOpen).collectList().filter(it -> !it.isEmpty()).map(it -> {
-                    int index = ThreadLocalRandom.current().nextInt(it.size());
-                    return it.get(index);
-                }).switchIfEmpty(connections.next()).toFuture();
-            } catch (RuntimeException e) {
-                throw Exceptions.bubble(e);
-            }
+        if (requiresMaster) {
+            return getConnection(getMaster());
         }
 
-        return getConnection(getMaster());
+        List<RedisNodeDescription> selection = rf.select(new ReadFrom.Nodes() {
+
+            @Override
+            public List<RedisNodeDescription> getNodes() {
+                return knownNodes;
+            }
+
+            @Override
+            public Iterator<RedisNodeDescription> iterator() {
+                return knownNodes.iterator();
+            }
+
+        });
+
+        if (selection.isEmpty()) {
+            throw new RedisException(String.format("Cannot determine a node to read (Known nodes: %s) with setting %s",
+                    knownNodes, rf));
+        }
+
+        try {
+
+            Flux<StatefulRedisConnection<K, V>> connections = Flux.empty();
+
+            for (RedisNodeDescription node : selection) {
+                connections = connections.concatWith(Mono.fromFuture(getConnection(node)));
+            }
+
+            if (OrderingReadFromAccessor.isOrderSensitive(rf) || selection.size() == 1) {
+                return connections.filter(StatefulConnection::isOpen).next().switchIfEmpty(connections.next()).toFuture();
+            }
+
+            return connections.filter(StatefulConnection::isOpen).collectList().filter(it -> !it.isEmpty()).map(it -> {
+                int index = ThreadLocalRandom.current().nextInt(it.size());
+                return it.get(index);
+            }).switchIfEmpty(connections.next()).toFuture();
+        } catch (RuntimeException e) {
+            throw Exceptions.bubble(e);
+        }
     }
 
     protected CompletableFuture<StatefulRedisConnection<K, V>> getConnection(RedisNodeDescription redisNodeDescription) {
